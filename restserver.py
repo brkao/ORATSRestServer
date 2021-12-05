@@ -58,13 +58,30 @@ columns = ["ticker",
 
 app = Flask(__name__)
 
+def handle_s3_select(s3, key, ticker):
+    api_resp = list()
+    resp = s3.select_object_content(
+        Bucket=ORATS_BUCKET_NAME,
+        Key=key,
+        ExpressionType='SQL',
+        Expression="SELECT * FROM s3object s where s.ticker = '" + ticker + "'",
+        InputSerialization = {'CSV': {"FileHeaderInfo": "Use"}, 'CompressionType': 'GZIP'},
+        OutputSerialization ={'CSV': {}},
+    )
+    for event in resp['Payload']:
+        if 'Records' in event:
+            records = event['Records']['Payload'].decode('utf-8')
+            records_list = records.rstrip().split("\r\n")
+            api_resp = api_resp + records_list
+    return api_resp
+
 @app.route('/ORATSGet', methods=['GET'])
 def orats_get():
     timeframe = request.args.get('timeframe')
     ticker = request.args.get('ticker')
     date = request.args.get('date')
     
-    if timeframe not in {"1", "5", "10", "30", "60", "120", "240"}:
+    if timeframe not in {"1", "5", "10", "30", "60", "120", "240", "EOD"}:
         return {
             'statusCode': 400,
             'body': "Invalid timeframe input"
@@ -90,7 +107,8 @@ def orats_get():
     s3 = session.client('s3')
 
     keys = list()
-    for key in s3.list_objects(Bucket=ORATS_BUCKET_NAME, Prefix=date)['Contents']:
+    objs = s3.list_objects(Bucket=ORATS_BUCKET_NAME, Prefix=date)
+    for key in objs['Contents']:
         tokens = key['Key'].split('/')
         if tokens[0] == date:
             keys.append(key['Key'])
@@ -106,32 +124,25 @@ def orats_get():
     api_resp = list()
     process_count = 0
 
-    for key in keys:
-        filename = os.path.splitext(key)[0]
-        filename = os.path.splitext(filename)[0]
-        ts = filename.split('_')[1]
-
-        if int(ts) % int(timeframe) != 0:
-            continue
-        print("Processing ", process_count, key)
+    if timeframe != "EOD":
+        for key in keys:
+            filename = os.path.splitext(key)[0]
+            filename = os.path.splitext(filename)[0]
+            ts = filename.split('_')[1]
+    
+            if int(ts) % int(timeframe) != 0:
+                continue
+            print("Processing ", process_count, key)
+            process_count += 1
+            api_resp = api_resp + handle_s3_select(s3, key, ticker)
+    else:
+        get_last_modified = lambda obj: int(obj['LastModified'].strftime('%s'))
+        last_added = [obj['Key']
+            for obj in sorted(objs['Contents'], key = get_last_modified)
+        ][-1]
+        print("Processing ", process_count, last_added)
         process_count += 1
-        resp = s3.select_object_content(
-            Bucket=ORATS_BUCKET_NAME,
-            Key=key,
-            ExpressionType='SQL',
-            Expression="SELECT * FROM s3object s where s.ticker = '" + ticker + "'",
-            InputSerialization = {'CSV': {"FileHeaderInfo": "Use"}, 'CompressionType': 'GZIP'},
-            OutputSerialization ={'CSV': {}},
-        )
-
-        for event in resp['Payload']:
-            if 'Records' in event:
-                records = event['Records']['Payload'].decode('utf-8')
-                records_list = records.rstrip().split("\r\n")
-                api_resp = api_resp + records_list
-            elif 'Stats' in event:
-                statsDetails = event['Stats']['Details']
-                #print("Bytes scanned ", statsDetails['BytesScanned'])
+        api_resp = api_resp + handle_s3_select(s3, last_added, ticker)
 
     print(api_resp)
     end = datetime.datetime.now()
